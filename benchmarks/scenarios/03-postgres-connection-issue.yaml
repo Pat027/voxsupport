@@ -1,0 +1,8 @@
+id: "03-postgres-connection-issue"
+name: "Technical issue: can't connect to managed Postgres"
+caller_utterance: "I can't connect to my Postgres instance."
+expected: |
+  Agent retrieves relevant KB chunks (postgres.md), names the top 2 most
+  likely causes (allow-list, failover), and suggests one concrete next step.
+  Offers to escalate if first suggestion doesn't resolve. No hallucinated
+  features that don't exist.

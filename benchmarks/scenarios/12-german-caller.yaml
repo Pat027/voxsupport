@@ -1,0 +1,8 @@
+id: "12-german-caller"
+name: "Caller speaks German (bilingual account)"
+caller_utterance: |
+  Hallo, ich möchte wissen, wie viel meine aktuelle Rechnung ist.
+expected: |
+  Kyutai STT 1B (en/fr) returns partial German support; for full DE the
+  agent either escalates or continues in English ("I'm best in English,
+  happy to continue that way"). No fabricated German responses.

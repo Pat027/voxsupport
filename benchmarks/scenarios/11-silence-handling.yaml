@@ -1,0 +1,7 @@
+id: "11-silence-handling"
+name: "Long silence after greeting"
+caller_utterance: "(caller stays silent for 6 seconds after greeting)"
+expected: |
+  Semantic VAD does not falsely detect end-of-turn during silence.
+  After 6 seconds, agent gently re-prompts: "Still there? How can I help?"
+  Agent does NOT spiral into repeated prompts.

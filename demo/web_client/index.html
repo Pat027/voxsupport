@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>voxsupport - Acme Cloud</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      background: #1e293b;
+      padding: 48px;
+      border-radius: 16px;
+      max-width: 560px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+    }
+    h1 { margin-top: 0; font-size: 28px; }
+    .subtitle { color: #94a3b8; margin-bottom: 32px; }
+    button {
+      width: 100%;
+      padding: 16px;
+      font-size: 16px;
+      font-weight: 600;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: transform 0.1s;
+    }
+    button:hover { transform: translateY(-2px); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    button.stop { background: #ef4444; }
+    .status {
+      margin-top: 24px;
+      padding: 16px;
+      background: #0f172a;
+      border-radius: 8px;
+      font-family: ui-monospace, "SF Mono", monospace;
+      font-size: 13px;
+      color: #94a3b8;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #475569; }
+    .dot.on { background: #22c55e; animation: pulse 1.2s infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .footer {
+      margin-top: 32px;
+      font-size: 13px;
+      color: #64748b;
+      text-align: center;
+    }
+    a { color: #60a5fa; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>voxsupport</h1>
+    <p class="subtitle">Voice customer-support agent for Acme Cloud.</p>
+
+    <button id="start-btn">Start conversation</button>
+
+    <div class="status" id="status">
+      <div class="row"><div class="dot" id="ws-dot"></div><span>WebSocket</span></div>
+      <div class="row"><div class="dot" id="mic-dot"></div><span>Microphone</span></div>
+      <div id="log"></div>
+    </div>
+
+    <div class="footer">
+      <a href="https://github.com/Pat027/voxsupport">GitHub</a> &middot;
+      Open-source, Apache 2.0
+    </div>
+  </div>
+
+  <script>
+    const btn = document.getElementById("start-btn");
+    const wsDot = document.getElementById("ws-dot");
+    const micDot = document.getElementById("mic-dot");
+    const logEl = document.getElementById("log");
+
+    let ws = null;
+    let stream = null;
+    let audioContext = null;
+    let processor = null;
+    let source = null;
+
+    const log = (msg) => {
+      const line = document.createElement("div");
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    };
+
+    async function start() {
+      btn.disabled = true;
+      btn.textContent = "Connecting...";
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { sampleRate: 24000, channelCount: 1, echoCancellation: true }
+        });
+        micDot.classList.add("on");
+        log("mic granted");
+
+        const wsUrl = `ws${location.protocol === "https:" ? "s" : ""}://${location.host}/web/stream`;
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = () => {
+          wsDot.classList.add("on");
+          log("websocket open");
+          setupAudioPipeline();
+          btn.textContent = "End conversation";
+          btn.disabled = false;
+          btn.classList.add("stop");
+        };
+
+        ws.onmessage = (ev) => {
+          if (ev.data instanceof ArrayBuffer) {
+            playAudio(ev.data);
+          }
+        };
+
+        ws.onclose = () => { wsDot.classList.remove("on"); log("websocket closed"); };
+        ws.onerror = (e) => log("websocket error");
+      } catch (err) {
+        log(`error: ${err.message}`);
+        btn.disabled = false;
+        btn.textContent = "Start conversation";
+      }
+    }
+
+    function setupAudioPipeline() {
+      audioContext = new AudioContext({ sampleRate: 24000 });
+      source = audioContext.createMediaStreamSource(stream);
+      processor = audioContext.createScriptProcessor(2048, 1, 1);
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      processor.onaudioprocess = (e) => {
+        if (ws?.readyState !== WebSocket.OPEN) return;
+        const float32 = e.inputBuffer.getChannelData(0);
+        const int16 = new Int16Array(float32.length);
+        for (let i = 0; i < float32.length; i++) {
+          int16[i] = Math.max(-1, Math.min(1, float32[i])) * 0x7fff;
+        }
+        ws.send(int16.buffer);
+      };
+    }
+
+    async function playAudio(buffer) {
+      try {
+        const int16 = new Int16Array(buffer);
+        const float32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 0x7fff;
+        const audioBuf = audioContext.createBuffer(1, float32.length, 24000);
+        audioBuf.copyToChannel(float32, 0);
+        const src = audioContext.createBufferSource();
+        src.buffer = audioBuf;
+        src.connect(audioContext.destination);
+        src.start();
+      } catch (err) {
+        log(`playback error: ${err.message}`);
+      }
+    }
+
+    function stop() {
+      if (ws) ws.close();
+      if (processor) processor.disconnect();
+      if (source) source.disconnect();
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      if (audioContext) audioContext.close();
+      btn.textContent = "Start conversation";
+      btn.classList.remove("stop");
+      btn.disabled = false;
+      wsDot.classList.remove("on");
+      micDot.classList.remove("on");
+    }
+
+    btn.addEventListener("click", () => {
+      if (btn.classList.contains("stop")) stop();
+      else start();
+    });
+  </script>
+</body>
+</html>

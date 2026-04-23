@@ -1,0 +1,9 @@
+id: "10-barge-in"
+name: "Caller interrupts the agent mid-sentence"
+caller_utterance: |
+  Agent begins reciting a long plans-and-pricing comparison.
+  At ~2 seconds into the agent's reply, caller interrupts: "Just tell me about Scale."
+expected: |
+  TTS stops within 200 ms of VAD detecting caller speech.
+  Agent acknowledges briefly and responds about Scale only.
+  Barge-in latency (caller_interrupt -> tts_stopped) is recorded in metrics.

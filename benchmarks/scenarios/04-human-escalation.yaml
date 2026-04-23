@@ -1,0 +1,7 @@
+id: "04-human-escalation"
+name: "Caller asks to speak to a human"
+caller_utterance: "Can I please talk to a real person?"
+expected: |
+  Agent immediately creates an escalation ticket via escalate_to_human,
+  confirms the ticket ID in the response, and transitions the call to
+  human handoff. Does not try to handle the ask itself.

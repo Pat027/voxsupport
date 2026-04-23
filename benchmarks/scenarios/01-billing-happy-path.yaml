@@ -1,0 +1,7 @@
+id: "01-billing-happy-path"
+name: "Caller asks for current invoice amount"
+caller_utterance: "Hey, what's my bill this month?"
+expected: |
+  Agent authenticates the caller, looks up the most recent bill via get_bill,
+  and states the amount in EUR with the status (open, paid, or overdue). No
+  PII in the response. No escalation needed.

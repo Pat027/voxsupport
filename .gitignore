@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Model weights (downloaded on first run, not committed)
+models/
+*.safetensors
+*.bin
+
+# Audio scratch
+*.wav
+*.mp3
+*.ogg
+!tests/fixtures/*.wav
+
+# Benchmark outputs
+benchmarks/results/*.csv
+benchmarks/results/*.png
+!benchmarks/results/.gitkeep
+
+# Data
+data/accounts.db
+data/*.pgdump
+
+# Docker volumes
+postgres_data/
+langfuse_data/
+grafana_data/
+
+# Secrets
+.env
+.env.local
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp

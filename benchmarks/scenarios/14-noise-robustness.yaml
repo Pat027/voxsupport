@@ -1,0 +1,7 @@
+id: "14-noise-robustness"
+name: "Caller speaks over background café noise (55 dB SPL)"
+caller_utterance: "What's included in my Growth plan again?"
+expected: |
+  STT WER stays under 8% despite noise (Kyutai STT is robust).
+  Agent retrieves plans.md chunks and responds accurately about Growth.
+  No re-prompt loop caused by transcription errors.

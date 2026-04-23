@@ -1,0 +1,13 @@
+id: "09-multi-turn-plan"
+name: "Multi-turn plan change — caller hesitates then confirms"
+caller_utterance: |
+  Turn 1: "I'm thinking about changing my plan."
+  Turn 2: "What do I get on Scale?"
+  Turn 3: "Okay, let's move me to Scale."
+expected: |
+  Turn 1: agent asks which plan and why (intent detection).
+  Turn 2: agent retrieves plans.md chunks via RAG and summarizes Scale's
+  benefits in one spoken sentence.
+  Turn 3: agent confirms ("shall I make the change now?") and on affirmative
+  calls change_plan with effective="immediately" (upgrade).
+  Conversation memory in Redis persists across turns.

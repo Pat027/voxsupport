@@ -1,0 +1,93 @@
+{
+  "title": "voxsupport - Production Voice Agent",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s",
+  "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "title": "TTFS (Time to First Speech) - target <800ms p50",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(voxsupport_tts_ttfs_seconds_bucket[5m])) * 1000", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, rate(voxsupport_tts_ttfs_seconds_bucket[5m])) * 1000", "legendFormat": "p95", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms"}}
+    },
+    {
+      "id": 2,
+      "title": "End-to-End Latency - target <2s p95",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(voxsupport_end_to_end_latency_seconds_bucket[5m])) * 1000", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, rate(voxsupport_end_to_end_latency_seconds_bucket[5m])) * 1000", "legendFormat": "p95", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms"}}
+    },
+    {
+      "id": 3,
+      "title": "Barge-In Responsiveness - target <200ms p50",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(voxsupport_barge_in_latency_seconds_bucket[5m])) * 1000", "legendFormat": "p50", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms"}}
+    },
+    {
+      "id": 4,
+      "title": "Cost per Phase (EUR, cumulative)",
+      "type": "stat",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "voxsupport_cost_eur_total", "legendFormat": "{{phase}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "currencyEUR"}}
+    },
+    {
+      "id": 5,
+      "title": "Call Outcomes",
+      "type": "piechart",
+      "gridPos": {"x": 0, "y": 16, "w": 8, "h": 8},
+      "targets": [
+        {"expr": "sum by (outcome) (voxsupport_calls_total)", "legendFormat": "{{outcome}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Escalations by Reason",
+      "type": "barchart",
+      "gridPos": {"x": 8, "y": 16, "w": 8, "h": 8},
+      "targets": [
+        {"expr": "sum by (reason) (voxsupport_escalations_total)", "legendFormat": "{{reason}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Guardrail Flags",
+      "type": "timeseries",
+      "gridPos": {"x": 16, "y": 16, "w": 8, "h": 8},
+      "targets": [
+        {"expr": "sum by (scanner) (rate(voxsupport_guardrail_flags_total[10m]))", "legendFormat": "{{scanner}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 8,
+      "title": "PII Leak Rate (must be 0)",
+      "type": "stat",
+      "gridPos": {"x": 0, "y": 24, "w": 12, "h": 4},
+      "targets": [{"expr": "voxsupport_pii_leak_rate", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "percentunit"}}
+    },
+    {
+      "id": 9,
+      "title": "Active Sessions",
+      "type": "stat",
+      "gridPos": {"x": 12, "y": 24, "w": 12, "h": 4},
+      "targets": [{"expr": "voxsupport_active_sessions", "refId": "A"}]
+    }
+  ]
+}

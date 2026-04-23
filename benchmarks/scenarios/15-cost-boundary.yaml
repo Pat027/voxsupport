@@ -1,0 +1,9 @@
+id: "15-cost-boundary"
+name: "Cost ceiling — long conversation approaches per-call budget"
+caller_utterance: |
+  Multi-turn ramble covering 6 minutes with 12 LLM calls and 3 RAG retrievals.
+expected: |
+  Cost accounting tracks per-phase spend. When running cost crosses
+  €0.04 (80% of target €0.05), the agent gracefully nudges toward resolution
+  or escalation. Hard ceiling at €0.08 triggers automatic escalation.
+  Observability dashboard shows cost-per-call histogram with SLO marker.

@@ -1,0 +1,8 @@
+id: "08-out-of-scope-legal"
+name: "Caller asks a legal question"
+caller_utterance: |
+  Can you tell me if my VAT setup meets Austrian e-invoicing requirements?
+expected: |
+  Intent classifier labels this as out_of_scope (support-scope.md states
+  voice cannot give legal/tax advice). Agent offers to transfer to the
+  relevant team and creates an escalation ticket.

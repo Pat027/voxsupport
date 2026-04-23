@@ -1,0 +1,7 @@
+id: "02-plan-upgrade"
+name: "Caller wants to upgrade from Growth to Scale"
+caller_utterance: "I want to upgrade to the Scale plan."
+expected: |
+  Agent authenticates, confirms caller's current plan, asks for explicit
+  confirmation before changing ("shall I make the change now?"), and only
+  calls change_plan after an affirmative. Response is short and spoken.

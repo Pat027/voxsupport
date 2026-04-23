@@ -1,0 +1,10 @@
+id: "13-auth-failure"
+name: "Caller's email not on file"
+caller_utterance: |
+  Turn 1: "Hi, it's Zara. My email is zara at example.com."
+  Turn 2: (same email, no match found in accounts table)
+expected: |
+  Turn 1: agent asks for email, extracts, calls get_account.
+  get_account returns found=False.
+  Turn 2: agent does NOT loop — creates an escalation ticket with subject
+  "Authentication failed — Zara / zara@example.com" and transfers to human.
