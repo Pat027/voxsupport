@@ -51,3 +51,7 @@ grafana_data/
 .idea/
 .vscode/
 *.swp
+
+# Audio outputs from smoke tests (not committed)
+tests/output/
+
