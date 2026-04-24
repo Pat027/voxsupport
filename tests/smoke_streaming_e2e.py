@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import sphn
 from dotenv import load_dotenv
+
+FAST_PATH = "--fast" in sys.argv
 
 load_dotenv("/home/pratikraut/self/voxsupport/.env")
 os.environ.setdefault(
@@ -41,8 +44,10 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 
+from src.agent.fast_graph import build_fast_dispatcher
 from src.agent.graph import build_default_graph
 from src.agent.llm import LLMRouter
+from src.agent.rag import KnowledgeBase
 from src.voice.stt import KyutaiSTTService
 from src.voice.tts import KyutaiTTSService
 
@@ -95,11 +100,19 @@ async def _main() -> None:
     await tts._ensure_loaded()
     print(f"[warmup] loaded in {time.monotonic() - t0:.1f}s")
 
-    # --- Graph (pre-authenticated so a single turn doesn't stop at auth) ---
-    async def nonstream_llm(messages):
-        return await router.chat(messages, temperature=0.2)
-
-    graph = build_default_graph(nonstream_llm)
+    # --- Agent (classic graph OR fast path) ---
+    if FAST_PATH:
+        print("[agent] mode=FAST (single function-calling LLM call)")
+        dsn = os.environ["DATABASE_URL"].replace("+asyncpg", "")
+        kb = KnowledgeBase(dsn)
+        dispatcher = build_fast_dispatcher(router, dsn, kb)
+        graph = None
+    else:
+        print("[agent] mode=CLASSIC (two-LLM-call graph)")
+        async def nonstream_llm(messages):
+            return await router.chat(messages, temperature=0.2)
+        graph = build_default_graph(nonstream_llm)
+        dispatcher = None
 
     # --- Stream audio through STT at real-time cadence ---
     CHUNK_MS = 80
@@ -153,20 +166,51 @@ async def _main() -> None:
         },
     }
     t_graph_start = time.monotonic()
-    result = await graph.ainvoke(state)
-    t_graph_done = time.monotonic()
-    print(
-        f"[agent] graph.ainvoke (classify + tool) took "
-        f"{(t_graph_done - t_graph_start)*1000:.0f}ms"
-    )
-    final_prompt = result.get("final_prompt")
-    if final_prompt is None:
-        # rule-based reply — nothing to stream; just use `response`
-        async def _chunks():
-            yield result.get("response", "")
-        stream = _chunks()
+    if FAST_PATH:
+        # Fast path: the dispatcher both runs the agent AND streams chunks.
+        # Bridge it to the same `stream` iterator pattern the rest of this
+        # test uses so the sentence-aggregator + TTS driver code is shared.
+        import asyncio as _asyncio
+        chunk_q: _asyncio.Queue[str | None] = _asyncio.Queue()
+
+        async def _emit(chunk: str) -> None:
+            await chunk_q.put(chunk)
+
+        async def _run_dispatcher() -> None:
+            try:
+                await dispatcher.run_turn(utter, state, _emit)
+            finally:
+                await chunk_q.put(None)
+
+        dispatcher_task = _asyncio.create_task(_run_dispatcher())
+
+        async def _stream_from_queue():
+            while True:
+                item = await chunk_q.get()
+                if item is None:
+                    return
+                yield item
+
+        stream = _stream_from_queue()
+        t_graph_done = time.monotonic()  # fast path: no separate graph step
+        print(
+            "[agent] fast path: dispatcher runs in parallel with stream consumption"
+        )
     else:
-        stream = router.stream_chat(final_prompt, temperature=0.2)
+        result = await graph.ainvoke(state)
+        t_graph_done = time.monotonic()
+        print(
+            f"[agent] graph.ainvoke (classify + tool) took "
+            f"{(t_graph_done - t_graph_start)*1000:.0f}ms"
+        )
+        final_prompt = result.get("final_prompt")
+        if final_prompt is None:
+            async def _chunks():
+                yield result.get("response", "")
+            stream = _chunks()
+        else:
+            stream = router.stream_chat(final_prompt, temperature=0.2)
+        dispatcher_task = None
 
     # --- Pump streaming chunks into TTS ---
     # In a live Pipecat pipeline, TextFrames flow into the TTSService's queue
@@ -243,6 +287,8 @@ async def _main() -> None:
         await sentence_q.put(buf.strip())
     await sentence_q.put(None)
     await tts_task
+    if dispatcher_task is not None:
+        await dispatcher_task
 
     t_first_audio_recorded = t_first_audio
 

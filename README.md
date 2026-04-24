@@ -51,6 +51,47 @@ open http://localhost:8080
 - **Prometheus**: http://localhost:9090
 - **Metrics endpoint**: http://localhost:8080/metrics
 
+## Local LLM mode (sub-1s TTFT)
+
+Cloud OpenAI adds ~1.5 s TTFT per LLM call. voxsupport's classic graph makes two sequential LLM calls per turn (classify + response), so cloud-cascade TTFS floors around ~5 s. Swapping to a local vLLM-served Qwen3-4B cuts each call to 30–400 ms.
+
+**Start the local LLM server** (needs NVIDIA GPU, ~9 GB for Qwen3-4B):
+
+```bash
+docker compose --profile local-llm up -d vllm
+# First run downloads the model (~9 GB). Subsequent starts < 10 s.
+curl http://localhost:8002/v1/models  # health check
+```
+
+**Point voxsupport at it** (`.env`):
+
+```bash
+LOCAL_LLM_BASE_URL=http://localhost:8002/v1
+LOCAL_LLM_MODEL=openai/Qwen/Qwen3-4B-Instruct-2507
+# Optional — halves LLM calls per turn by merging classify + response:
+VOXSUPPORT_FAST_PATH=1
+```
+
+When `LOCAL_LLM_BASE_URL` is set, the router puts the local endpoint **first** in its provider list; cloud providers become fallback. Unset to return to cloud-only.
+
+### Measured TTFT (NVIDIA L40S, Qwen3-4B-Instruct-2507)
+
+| Path | LLM TTFT | end-of-speech → first LLM chunk |
+|---|---|---|
+| Cloud OpenAI, classic graph | ~1500 ms | ~1350 ms |
+| Local vLLM, classic graph | **~34 ms** | **~444 ms** |
+| Local vLLM, fast path (direct answer) | **~184 ms** | — |
+| Local vLLM, fast path (tool call) | ~400 ms | — |
+
+Run `tests/smoke_local_llm.py` and `tests/smoke_fast_path.py` to reproduce.
+
+### GPU placement
+
+Kyutai STT/TTS hardcode `cuda:0` unless `KYUTAI_DEVICE` is set. The vLLM service defaults to `CUDA_VISIBLE_DEVICES=1` (assumes multi-GPU). For a single-GPU host, either:
+
+- Set `VLLM_CUDA_DEVICES=0` in `.env` (share cuda:0 with Kyutai; `gpu-memory-utilization` is already capped at 0.90 to leave headroom).
+- Or set `KYUTAI_DEVICE=cuda:1` to push Kyutai to the second GPU if available.
+
 ## Call it by phone (v0.9)
 
 ```bash

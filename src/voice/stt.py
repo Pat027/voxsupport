@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -123,7 +124,8 @@ class KyutaiSTTService(STTService):
         from moshi.models import loaders
         from moshi.run_inference import InferenceState
 
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        device_str = os.environ.get("KYUTAI_DEVICE", "cuda:0")
+        device = torch.device(device_str if torch.cuda.is_available() else "cpu")
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         ci = loaders.CheckpointInfo.from_hf_repo(self.model_name)
         mimi = ci.get_mimi(device=device)

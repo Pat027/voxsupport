@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -84,7 +85,8 @@ class KyutaiTTSService(TTSService):
             TTSModel,
         )
 
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        device_str = os.environ.get("KYUTAI_DEVICE", "cuda:0")
+        device = torch.device(device_str if torch.cuda.is_available() else "cpu")
         ckpt = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
         return TTSModel.from_checkpoint_info(
             ckpt, n_q=32, temp=self.temperature, device=device

@@ -36,7 +36,37 @@ class ProviderSpec:
 
 
 def default_providers() -> list[ProviderSpec]:
+    """Build the provider list in preferred priority order.
+
+    When `LOCAL_LLM_BASE_URL` (or legacy `LLAMA_BASE_URL`) is set, the local
+    vLLM endpoint goes to the FRONT of the list so it wins by default — cloud
+    providers then serve as failover. With an idle local vLLM at ~200 ms TTFT
+    this is the sub-1s path.
+
+    Model id for local is set via `LOCAL_LLM_MODEL` (default: Qwen3-4B).
+    """
     providers: list[ProviderSpec] = []
+
+    local_base = os.environ.get("LOCAL_LLM_BASE_URL") or os.environ.get("LLAMA_BASE_URL")
+    if local_base:
+        local_model = os.environ.get(
+            "LOCAL_LLM_MODEL",
+            "openai/Qwen/Qwen3-4B-Instruct-2507",
+        )
+        # LiteLLM treats "openai/<model>" as "OpenAI-compatible endpoint using this model id".
+        if not local_model.startswith("openai/"):
+            local_model = f"openai/{local_model}"
+        providers.append(
+            ProviderSpec(
+                name="local-vllm",
+                model=local_model,
+                api_base=local_base,
+                # Local LLM should be fast; timeout more aggressively so the
+                # failover to cloud kicks in on a genuine stall, not slow net.
+                timeout_s=float(os.environ.get("LOCAL_LLM_TIMEOUT_S", "8.0")),
+            )
+        )
+
     if os.environ.get("ANTHROPIC_API_KEY"):
         providers.append(
             ProviderSpec(
@@ -53,18 +83,11 @@ def default_providers() -> list[ProviderSpec]:
                 api_key_env="OPENAI_API_KEY",
             )
         )
-    if os.environ.get("LLAMA_BASE_URL"):
-        providers.append(
-            ProviderSpec(
-                name="llama-vllm",
-                model="openai/meta-llama/Llama-3.1-70B-Instruct",
-                api_base=os.environ["LLAMA_BASE_URL"],
-            )
-        )
+
     if not providers:
         logger.warning(
-            "No LLM providers configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
-            "or LLAMA_BASE_URL."
+            "No LLM providers configured. Set LOCAL_LLM_BASE_URL (+ optional "
+            "LOCAL_LLM_MODEL), ANTHROPIC_API_KEY, or OPENAI_API_KEY."
         )
     return providers
 
@@ -114,7 +137,14 @@ class LLMRouter:
                         model=p.model,
                         messages=messages,
                         api_base=p.api_base,
-                        api_key=os.environ.get(p.api_key_env) if p.api_key_env else None,
+                        # vLLM + other self-hosted OpenAI-compatible servers need a
+                    # non-empty api_key string even when auth is disabled — the
+                    # official OpenAI client library rejects None.
+                    api_key=(
+                        os.environ.get(p.api_key_env)
+                        if p.api_key_env
+                        else "EMPTY"
+                    ),
                         **kwargs,
                     ),
                     timeout=p.timeout_s,
@@ -158,7 +188,14 @@ class LLMRouter:
                     model=p.model,
                     messages=messages,
                     api_base=p.api_base,
-                    api_key=os.environ.get(p.api_key_env) if p.api_key_env else None,
+                    # vLLM + other self-hosted OpenAI-compatible servers need a
+                    # non-empty api_key string even when auth is disabled — the
+                    # official OpenAI client library rejects None.
+                    api_key=(
+                        os.environ.get(p.api_key_env)
+                        if p.api_key_env
+                        else "EMPTY"
+                    ),
                     stream=True,
                     **kwargs,
                 )

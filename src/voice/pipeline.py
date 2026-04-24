@@ -19,7 +19,7 @@ from pipecat.frames.frames import (
     Frame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
-    LLMMessagesFrame,
+    LLMMessagesAppendFrame,
     StartFrame,
     TextFrame,
     TranscriptionFrame,
@@ -30,16 +30,17 @@ from pipecat.frames.frames import (
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.llm_response import (
-    LLMAssistantResponseAggregator,
-    LLMUserResponseAggregator,
-)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.vad.silero import SileroVADAnalyzer
+try:
+    from pipecat.audio.vad.silero import SileroVADAnalyzer
+except ImportError:
+    from pipecat.vad.silero import SileroVADAnalyzer
 
+from src.agent.fast_graph import build_fast_dispatcher
 from src.agent.graph import build_default_graph
 from src.agent.llm import LLMRouter
 from src.agent.prompts import SYSTEM_VOICE
+from src.agent.rag import KnowledgeBase
 from src.guardrails.pii import default_redactor
 from src.guardrails.safety import default_scanner
 from src.memory.conversation import ConversationMemory
@@ -92,7 +93,23 @@ class AgentProcessor(FrameProcessor):
         self._redactor = default_redactor()
         self._scanner = default_scanner()
         self._tracer = default_tracer()
-        self._graph = build_default_graph(self._llm_call)
+
+        # Path selector: fast = single function-calling LLM call per turn
+        # (sub-1s on local vLLM). Classic = explicit LangGraph state machine
+        # (two LLM calls per turn, robust, used when fast path is off).
+        self._fast_path = bool(os.environ.get("VOXSUPPORT_FAST_PATH"))
+        if self._fast_path:
+            dsn = os.environ.get(
+                "DATABASE_URL",
+                "postgresql://voxsupport:voxsupport@localhost:5432/voxsupport",
+            ).replace("+asyncpg", "")
+            kb = KnowledgeBase(dsn)
+            self._dispatcher = build_fast_dispatcher(self._router, dsn, kb)
+            self._graph = None
+            logger.info("AgentProcessor: FAST PATH enabled (function-calling)")
+        else:
+            self._graph = build_default_graph(self._llm_call)
+            self._dispatcher = None
 
         # Per-session agent state — survives across turns within this call.
         self._session_state: dict[str, Any] = {
@@ -161,31 +178,50 @@ class AgentProcessor(FrameProcessor):
         # 3. Persist to conversation memory
         await self.memory.append(self.session_id, "user", transcript_for_agent)
 
-        # 4. Run the LangGraph agent
-        state = {
-            "utterance": transcript_for_agent,
-            **self._session_state,
-        }
-        result = await self._graph.ainvoke(state)
+        # 4. Run the agent (fast path or classic graph).
+        if self._dispatcher is not None:
+            state = {
+                "utterance": transcript_for_agent,
+                **self._session_state,
+            }
 
-        # Carry forward session-level state for the next turn.
-        for k in ("authenticated", "account", "pending_confirmation"):
-            if k in result:
-                self._session_state[k] = result[k]
-        if result.get("should_escalate"):
-            reason = "user_request" if "human_escalation" in str(result.get("intent", "")) else "low_confidence"
-            ESCALATIONS_TOTAL.labels(reason=reason).inc()
+            async def _push(chunk: str) -> None:
+                await self.push_frame(TextFrame(chunk), direction)
 
-        # 5. Generate the spoken reply — streaming when the graph handed us a
-        # prompt (the common case). Rule-based nodes (auth, escalate, etc.)
-        # instead set `response` directly, so we push it whole.
-        final_prompt = result.get("final_prompt")
-        if final_prompt:
-            response_text = await self._stream_reply(final_prompt, direction)
+            fast_result = await self._dispatcher.run_turn(
+                transcript_for_agent, state, _push
+            )
+            for k, v in fast_result.session_updates.items():
+                self._session_state[k] = v
+            if fast_result.should_escalate:
+                ESCALATIONS_TOTAL.labels(reason="tool_call").inc()
+            response_text = fast_result.text
         else:
-            response_text = result.get("response", "")
-            if response_text:
-                await self.push_frame(TextFrame(response_text), direction)
+            state = {
+                "utterance": transcript_for_agent,
+                **self._session_state,
+            }
+            result = await self._graph.ainvoke(state)
+            for k in ("authenticated", "account", "pending_confirmation"):
+                if k in result:
+                    self._session_state[k] = result[k]
+            if result.get("should_escalate"):
+                reason = (
+                    "user_request"
+                    if "human_escalation" in str(result.get("intent", ""))
+                    else "low_confidence"
+                )
+                ESCALATIONS_TOTAL.labels(reason=reason).inc()
+
+            # 5. Generate the spoken reply — streaming when the graph handed us
+            # a final prompt; rule-based nodes set `response` directly.
+            final_prompt = result.get("final_prompt")
+            if final_prompt:
+                response_text = await self._stream_reply(final_prompt, direction)
+            else:
+                response_text = result.get("response", "")
+                if response_text:
+                    await self.push_frame(TextFrame(response_text), direction)
 
         # 6. Output guardrail scan (on the assembled text — scans can't run
         # mid-stream without corrupting audio). This is a known tradeoff:
@@ -284,7 +320,7 @@ async def run_conversation(transport) -> None:
         # Greet the caller so they know the line's open.
         await task.queue_frames(
             [
-                LLMMessagesFrame(
+                LLMMessagesAppendFrame(
                     messages=[
                         {"role": "system", "content": SYSTEM_VOICE},
                         {
