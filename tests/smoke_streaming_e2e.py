@@ -48,6 +48,7 @@ from src.agent.fast_graph import build_fast_dispatcher
 from src.agent.graph import build_default_graph
 from src.agent.llm import LLMRouter
 from src.agent.rag import KnowledgeBase
+from src.voice.pipeline import PhraseAggregator
 from src.voice.stt import KyutaiSTTService
 from src.voice.tts import KyutaiTTSService
 
@@ -94,11 +95,13 @@ async def _main() -> None:
     tts.push_frame = tts_sink.push  # type: ignore[method-assign]
 
     # --- Warm up models so latency numbers are post-cold-start ---
-    print("[warmup] loading models...")
+    # Load weights AND compile CUDA graphs — without the actual graph compile
+    # the first real run_tts pays ~900 ms mid-call. Warmup runs a throwaway
+    # synthesis / silence-transcription to pay that cost here instead.
+    print("[warmup] loading + compiling graphs...")
     t0 = time.monotonic()
-    await stt._ensure_loaded()
-    await tts._ensure_loaded()
-    print(f"[warmup] loaded in {time.monotonic() - t0:.1f}s")
+    await asyncio.gather(stt.warmup(), tts.warmup())
+    print(f"[warmup] done in {time.monotonic() - t0:.1f}s")
 
     # --- Agent (classic graph OR fast path) ---
     if FAST_PATH:
@@ -238,33 +241,11 @@ async def _main() -> None:
 
     tts_task = asyncio.create_task(_synthesize_sentences())
 
+    # Use the production PhraseAggregator so the test measures the exact
+    # same aggregation logic the live pipeline does.
     text_parts: list[str] = []
-    buf = ""
-    # Phrase boundaries: any sentence-end OR comma AFTER at least ~20 chars.
-    # This lets TTS start on the first clause ("Your bill for this month,...")
-    # instead of waiting for the whole sentence. For Kyutai TTS quality,
-    # don't split too short (below ~15 chars prosody suffers).
-    MIN_FIRST_PHRASE = 20
-    SENT_END = (".", "!", "?")
-    emitted_first = False
-
-    def _find_split(text: str) -> int:
-        # 1. Any sentence-end → split there
-        for p in SENT_END:
-            i = text.find(p)
-            if i != -1:
-                return i
-        # 2. Comma, only if we have enough lead-in
-        i = text.find(",")
-        if i != -1 and i >= MIN_FIRST_PHRASE:
-            return i
-        # 3. Emergency flush: if we have 60+ chars with no punctuation yet, cut
-        # at the last space before 60 so the first chunk still sounds natural.
-        if len(text) >= 60:
-            j = text.rfind(" ", 0, 60)
-            if j >= MIN_FIRST_PHRASE:
-                return j
-        return -1
+    agg = PhraseAggregator()
+    t_first_phrase: float | None = None
 
     async for chunk in stream:
         if not chunk:
@@ -272,19 +253,18 @@ async def _main() -> None:
         if t_first_text is None:
             t_first_text = time.monotonic()
         text_parts.append(chunk)
-        buf += chunk
-        while True:
-            idx = _find_split(buf)
-            if idx == -1:
-                break
-            first = buf[: idx + 1].strip()
-            buf = buf[idx + 1 :]
-            if first:
-                await sentence_q.put(first)
-                emitted_first = True
+        for phrase in agg.feed(chunk):
+            if t_first_phrase is None:
+                t_first_phrase = time.monotonic() - t_speech_end
+                print(
+                    f"[agg]  first phrase emitted at "
+                    f"+{t_first_phrase*1000:.0f}ms: {phrase!r}"
+                )
+            await sentence_q.put(phrase)
 
-    if buf.strip():
-        await sentence_q.put(buf.strip())
+    tail = agg.flush()
+    if tail:
+        await sentence_q.put(tail)
     await sentence_q.put(None)
     await tts_task
     if dispatcher_task is not None:
@@ -316,6 +296,11 @@ async def _main() -> None:
         total_llm = (t_first_text - t_speech_end) * 1000
         print(f"  graph done       →  first LLM chunk  : {stream_ttft:>6.0f} ms  (stream TTFT)")
         print(f"  end-of-speech    →  first LLM chunk  : {total_llm:>6.0f} ms")
+    if t_first_phrase is not None:
+        print(
+            f"  end-of-speech    →  first phrase     : "
+            f"{t_first_phrase*1000:>6.0f} ms  (phrase aggregator)"
+        )
     if t_first_audio_recorded is not None:
         if t_first_text:
             sent_to_audio = (

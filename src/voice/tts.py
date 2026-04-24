@@ -77,6 +77,20 @@ class KyutaiTTSService(TTSService):
             self._sample_rate = self._tts.mimi.sample_rate
             logger.info("Kyutai TTS loaded in %.1fs", time.monotonic() - t0)
 
+    async def warmup(self) -> None:
+        """Ensure weights are loaded. A true synthesis warmup (running
+        `generate` once at startup) would compile the CUDA graphs but
+        triggers a known torch.compile + stochastic sampling bug:
+
+            RuntimeError: Offset increment outside graph capture encountered
+            unexpectedly.
+
+        when the first REAL call after warmup samples a different multinomial
+        path. Until that's fixed upstream in moshi/torch, we accept the
+        ~900 ms first-call TTFS tax. The STT + SBert warmups still run.
+        """
+        await self._ensure_loaded()
+
     def _load_model(self):
         import torch
         from moshi.run_tts import (

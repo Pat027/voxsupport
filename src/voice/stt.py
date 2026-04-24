@@ -119,6 +119,29 @@ class KyutaiSTTService(STTService):
             self._state.printer = self._capture  # type: ignore[attr-defined]
             logger.info("Kyutai STT loaded in %.1fs", time.monotonic() - t0)
 
+    async def warmup(self) -> None:
+        """Run a throwaway 500-ms silence through mimi.encode + lm_gen.step to
+        compile CUDA graphs. Subsequent first-chunk latency drops to its
+        steady-state ~80 ms instead of paying compilation cost mid-call.
+        """
+        await self._ensure_loaded()
+        logger.info("STT warmup: compiling CUDA graphs")
+        t0 = time.monotonic()
+        # Feed 500 ms of silence; reset streaming state afterwards so the
+        # first real turn starts clean.
+        silence = np.zeros(int(0.5 * SAMPLE_RATE_HZ), dtype=np.float32)
+
+        def _warm() -> None:
+            self._reset_turn_state()
+            self._process_pcm_sync(silence)
+            # Reset again so the first real turn doesn't inherit the warmup
+            # state.
+            self._reset_turn_state()
+
+        async with self._gpu_lock:
+            await asyncio.to_thread(_warm)
+        logger.info("STT warmup done in %.1fs", time.monotonic() - t0)
+
     def _load_state(self):
         import torch
         from moshi.models import loaders

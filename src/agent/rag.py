@@ -50,6 +50,26 @@ class KnowledgeBase:
             self._embedder = SentenceTransformer(EMBEDDING_MODEL)
         return self._embedder
 
+    async def warmup(self) -> None:
+        """Load the embedding model and run one throwaway encode.
+
+        Without this, the first lookup_kb call during a live caller turn pays
+        ~2-3 s loading SBert weights before any retrieval happens. Calling
+        warmup at process start moves that cost out of the call path.
+        """
+        import asyncio
+        import time as _time
+
+        t0 = _time.monotonic()
+        # Loading + encode are CPU-heavy on first call (weights download + init).
+        # Offload to a thread so we don't block the event loop on startup.
+        await asyncio.to_thread(
+            lambda: self.embedder.encode(
+                ["warmup"], normalize_embeddings=True
+            )
+        )
+        logger.info("KnowledgeBase warmup done in %.1fs", _time.monotonic() - t0)
+
     # ----- Ingestion -------------------------------------------------------
 
     @staticmethod

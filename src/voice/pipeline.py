@@ -64,6 +64,92 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Phrase aggregator
+# ---------------------------------------------------------------------------
+
+# Punctuation that terminates a spoken phrase.
+_SENT_END = (".", "!", "?")
+# Minimum length of a phrase before we'll split on a comma. Too-short first
+# phrases ("Yes,") sound choppy and burn a TTS call with little audio payoff.
+_MIN_PHRASE_CHARS = 20
+# Hard cap — even without punctuation, emit at this point (at the last word
+# boundary) so latency doesn't run away on comma-less LLM replies.
+_MAX_PHRASE_CHARS = 60
+
+
+class PhraseAggregator:
+    """Token-stream → phrase-stream buffer.
+
+    The TTS service synthesizes one phrase per `run_tts` call. Pushing
+    token-by-token gives Kyutai too little context for good prosody; waiting
+    for whole sentences adds 1-2 s to TTFS. Phrase-level (sentence end OR
+    comma-after-20-chars OR 60-char soft cap) is the sweet spot.
+
+    Usage::
+
+        agg = PhraseAggregator()
+        for tok in llm_tokens:
+            for phrase in agg.feed(tok):
+                await push_text_frame(phrase)
+        # flush any buffered remainder at end of stream
+        tail = agg.flush()
+        if tail:
+            await push_text_frame(tail)
+    """
+
+    def __init__(
+        self,
+        *,
+        min_phrase_chars: int = _MIN_PHRASE_CHARS,
+        max_phrase_chars: int = _MAX_PHRASE_CHARS,
+    ) -> None:
+        self._buf = ""
+        self._min = min_phrase_chars
+        self._max = max_phrase_chars
+
+    def feed(self, chunk: str) -> list[str]:
+        """Accept a chunk; return any phrases that became complete."""
+        if not chunk:
+            return []
+        self._buf += chunk
+        out: list[str] = []
+        while True:
+            idx = self._find_split(self._buf)
+            if idx == -1:
+                break
+            phrase = self._buf[: idx + 1].strip()
+            self._buf = self._buf[idx + 1 :].lstrip()
+            if phrase:
+                out.append(phrase)
+        return out
+
+    def flush(self) -> str:
+        """Return whatever is buffered (end of stream). Resets state."""
+        tail = self._buf.strip()
+        self._buf = ""
+        return tail
+
+    def _find_split(self, text: str) -> int:
+        # 1. Any sentence terminator → split there.
+        for p in _SENT_END:
+            i = text.find(p)
+            if i != -1:
+                return i
+        # 2. Comma, only once we've accumulated enough lead-in so that the
+        # first phrase still carries prosody.
+        i = text.find(",")
+        if i != -1 and i >= self._min:
+            return i
+        # 3. Emergency flush at the last word boundary below the hard cap,
+        # for LLMs that stream long comma-less sentences.
+        if len(text) >= self._max:
+            j = text.rfind(" ", 0, self._max)
+            if j >= self._min:
+                return j
+        return -1
+
+
+# ---------------------------------------------------------------------------
 # Agent-integrating frame processor
 # ---------------------------------------------------------------------------
 
@@ -94,17 +180,20 @@ class AgentProcessor(FrameProcessor):
         self._scanner = default_scanner()
         self._tracer = default_tracer()
 
+        # Shared KB — built here so build_pipeline can warm it up alongside
+        # the voice models, regardless of whether fast path or classic is on.
+        dsn = os.environ.get(
+            "DATABASE_URL",
+            "postgresql://voxsupport:voxsupport@localhost:5432/voxsupport",
+        ).replace("+asyncpg", "")
+        self._kb = KnowledgeBase(dsn)
+
         # Path selector: fast = single function-calling LLM call per turn
         # (sub-1s on local vLLM). Classic = explicit LangGraph state machine
         # (two LLM calls per turn, robust, used when fast path is off).
         self._fast_path = bool(os.environ.get("VOXSUPPORT_FAST_PATH"))
         if self._fast_path:
-            dsn = os.environ.get(
-                "DATABASE_URL",
-                "postgresql://voxsupport:voxsupport@localhost:5432/voxsupport",
-            ).replace("+asyncpg", "")
-            kb = KnowledgeBase(dsn)
-            self._dispatcher = build_fast_dispatcher(self._router, dsn, kb)
+            self._dispatcher = build_fast_dispatcher(self._router, dsn, self._kb)
             self._graph = None
             logger.info("AgentProcessor: FAST PATH enabled (function-calling)")
         else:
@@ -185,12 +274,20 @@ class AgentProcessor(FrameProcessor):
                 **self._session_state,
             }
 
+            # Aggregate token-level chunks from the dispatcher into phrases
+            # before pushing to TTS — same pattern as _stream_reply below.
+            agg = PhraseAggregator()
+
             async def _push(chunk: str) -> None:
-                await self.push_frame(TextFrame(chunk), direction)
+                for phrase in agg.feed(chunk):
+                    await self.push_frame(TextFrame(phrase), direction)
 
             fast_result = await self._dispatcher.run_turn(
                 transcript_for_agent, state, _push
             )
+            tail = agg.flush()
+            if tail:
+                await self.push_frame(TextFrame(tail), direction)
             for k, v in fast_result.session_updates.items():
                 self._session_state[k] = v
             if fast_result.should_escalate:
@@ -245,16 +342,24 @@ class AgentProcessor(FrameProcessor):
         messages: list[dict[str, str]],
         direction: FrameDirection,
     ) -> str:
-        """Stream LLM tokens; push each as a TextFrame; return the full text.
+        """Stream LLM tokens, aggregate into phrases, push as TextFrames.
 
-        Downstream TTS aggregates tokens to sentence boundaries (Pipecat default)
-        so the first audio chunk hits the transport ~1 sentence after first token.
+        Each phrase triggers one `TTSService.run_tts` call, so a phrase-level
+        boundary (not full-sentence) lets the first spoken audio hit the
+        transport ~500-800 ms earlier on multi-sentence replies — the
+        difference between "Your bill is 49 euros," streaming while the LLM
+        finishes "and it's currently open" vs. waiting for the full stop.
         """
         chunks: list[str] = []
         est_in = sum(len(m["content"]) for m in messages) // 4
+        agg = PhraseAggregator()
         async for chunk in self._router.stream_chat(messages, temperature=0.2):
             chunks.append(chunk)
-            await self.push_frame(TextFrame(chunk), direction)
+            for phrase in agg.feed(chunk):
+                await self.push_frame(TextFrame(phrase), direction)
+        tail = agg.flush()
+        if tail:
+            await self.push_frame(TextFrame(tail), direction)
         full = "".join(chunks)
         # Cost accounting (see note: streaming completions don't surface token
         # usage uniformly via litellm, so we estimate at chunk boundaries).
@@ -276,7 +381,12 @@ async def build_pipeline(
     *,
     session_id: str | None = None,
 ) -> tuple[Pipeline, PipelineTask, str]:
-    """Wire STT -> AgentProcessor -> TTS into a Pipecat pipeline."""
+    """Wire STT -> AgentProcessor -> TTS into a Pipecat pipeline.
+
+    Warms STT, TTS, and the SBert embedder BEFORE returning so the first
+    caller doesn't pay cold-start taxes (~900ms TTS + ~500ms STT + ~2-3s
+    SBert) mid-conversation.
+    """
     session_id = session_id or str(uuid.uuid4())
 
     memory = ConversationMemory(
@@ -287,6 +397,14 @@ async def build_pipeline(
     stt = KyutaiSTTService()
     agent = AgentProcessor(session_id=session_id, memory=memory, cost_ledger=cost_ledger)
     tts = KyutaiTTSService()
+
+    # Warm all three in parallel — this happens ONCE per process, before the
+    # caller's first turn. Cost: ~5-10 s of startup; savings: ~3-4 s of
+    # user-perceived latency on the first spoken reply.
+    import asyncio as _asyncio
+
+    warmup_tasks = [stt.warmup(), tts.warmup(), agent._kb.warmup()]
+    await _asyncio.gather(*warmup_tasks, return_exceptions=True)
 
     pipeline = Pipeline(
         [
