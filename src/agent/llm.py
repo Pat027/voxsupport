@@ -3,6 +3,13 @@ LLM routing layer — LiteLLM with circuit-breaker failover across providers.
 
 Default provider order: Anthropic → OpenAI → local Llama (via vLLM at
 LLAMA_BASE_URL). First-success wins; on error, rolls over to next.
+
+Two call modes:
+- `chat(messages)` → str: full completion, blocking. Used for one-shot decisions
+  (intent classification, structured outputs) where streaming adds no value.
+- `stream_chat(messages)` → AsyncGenerator[str, None]: yields text chunks as the
+  provider emits them. Used for the final spoken reply so TTS can start
+  synthesizing the opening of the response before the LLM finishes thinking.
 """
 
 from __future__ import annotations
@@ -10,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
 from time import monotonic
 
@@ -95,7 +102,7 @@ class LLMRouter:
         self._breaker = _CircuitBreaker()
 
     async def chat(self, messages: list[dict[str, str]], **kwargs) -> str:
-        """Return completion text. Tries providers in order until one works."""
+        """Return a full completion. Tries providers in order until one works."""
         last_error: Exception | None = None
         for p in self.providers:
             if self._breaker.is_open(p.name):
@@ -127,4 +134,58 @@ class LLMRouter:
 
         raise RuntimeError(
             f"All LLM providers failed. Last error: {last_error!r}"
+        )
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs,
+    ) -> AsyncGenerator[str, None]:
+        """Yield text chunks as the provider streams them.
+
+        Falls over to the next provider ONLY if the first provider never
+        emitted a chunk. Once tokens start flowing we commit — mid-stream
+        failover would corrupt the reply.
+        """
+        last_error: Exception | None = None
+        for p in self.providers:
+            if self._breaker.is_open(p.name):
+                continue
+            try:
+                start = monotonic()
+                emitted_any = False
+                stream = await litellm.acompletion(
+                    model=p.model,
+                    messages=messages,
+                    api_base=p.api_base,
+                    api_key=os.environ.get(p.api_key_env) if p.api_key_env else None,
+                    stream=True,
+                    **kwargs,
+                )
+                async for part in stream:
+                    # Shape differs across providers; litellm normalizes to OAI format.
+                    choices = getattr(part, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    chunk = getattr(delta, "content", None) if delta else None
+                    if chunk:
+                        if not emitted_any:
+                            ttft = (monotonic() - start) * 1000
+                            logger.debug("%s first token in %.0fms", p.name, ttft)
+                            emitted_any = True
+                        yield chunk
+                self._breaker.record_success(p.name)
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Provider %s streaming failed: %s", p.name, exc)
+                self._breaker.record_failure(p.name)
+                last_error = exc
+                # Only try next provider if nothing was emitted yet.
+                if emitted_any:
+                    raise
+                continue
+
+        raise RuntimeError(
+            f"All LLM providers failed (streaming). Last error: {last_error!r}"
         )

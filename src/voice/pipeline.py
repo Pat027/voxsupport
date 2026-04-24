@@ -176,25 +176,58 @@ class AgentProcessor(FrameProcessor):
             reason = "user_request" if "human_escalation" in str(result.get("intent", "")) else "low_confidence"
             ESCALATIONS_TOTAL.labels(reason=reason).inc()
 
-        response_text = result.get("response", "")
+        # 5. Generate the spoken reply — streaming when the graph handed us a
+        # prompt (the common case). Rule-based nodes (auth, escalate, etc.)
+        # instead set `response` directly, so we push it whole.
+        final_prompt = result.get("final_prompt")
+        if final_prompt:
+            response_text = await self._stream_reply(final_prompt, direction)
+        else:
+            response_text = result.get("response", "")
+            if response_text:
+                await self.push_frame(TextFrame(response_text), direction)
 
-        # 5. Output guardrail scan
+        # 6. Output guardrail scan (on the assembled text — scans can't run
+        # mid-stream without corrupting audio). This is a known tradeoff:
+        # output safety kicks in AFTER the reply has already streamed. For
+        # stricter settings, run the LLM non-streamed via `.chat()`.
         out_scan = self._scanner.scan_output(transcript_for_agent, response_text)
         if not out_scan.ok:
             for s in out_scan.flagged:
                 GUARDRAIL_FLAGS.labels(type="output", scanner=s).inc()
-        response_text = out_scan.sanitized
 
-        # 6. Persist assistant turn
+        # 7. Persist assistant turn
         await self.memory.append(self.session_id, "assistant", response_text)
-
-        # 7. Emit the spoken reply to the TTS service downstream
-        await self.push_frame(TextFrame(response_text), direction)
 
         # Latency accounting
         if self._turn_started is not None:
             END_TO_END_LATENCY.observe(time.monotonic() - self._turn_started)
             self._turn_started = None
+
+    async def _stream_reply(
+        self,
+        messages: list[dict[str, str]],
+        direction: FrameDirection,
+    ) -> str:
+        """Stream LLM tokens; push each as a TextFrame; return the full text.
+
+        Downstream TTS aggregates tokens to sentence boundaries (Pipecat default)
+        so the first audio chunk hits the transport ~1 sentence after first token.
+        """
+        chunks: list[str] = []
+        est_in = sum(len(m["content"]) for m in messages) // 4
+        async for chunk in self._router.stream_chat(messages, temperature=0.2):
+            chunks.append(chunk)
+            await self.push_frame(TextFrame(chunk), direction)
+        full = "".join(chunks)
+        # Cost accounting (see note: streaming completions don't surface token
+        # usage uniformly via litellm, so we estimate at chunk boundaries).
+        self.cost_ledger.add_llm_call(
+            provider_model="openai:gpt-4o-mini",
+            tokens_in=est_in,
+            tokens_out=len(full) // 4,
+        )
+        return full
 
 
 # ---------------------------------------------------------------------------

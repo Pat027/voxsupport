@@ -72,8 +72,11 @@ class AgentState(TypedDict, total=False):
     pending_confirmation: dict[str, Any] | None
     confidence: float
 
-    # Output
+    # Output — exactly ONE of these is populated by each terminal node:
+    #   response:     rule-based reply, no LLM call needed (auth, escalate, etc.)
+    #   final_prompt: messages to stream through the LLM for the spoken reply
     response: str
+    final_prompt: list[dict[str, str]]
     should_escalate: bool
     ticket_id: str | None
 
@@ -147,21 +150,19 @@ def build_agent_graph(
             return {"response": "", "should_escalate": False, "intent": "authentication"}
         bills = await get_bill(dsn, account["account_id"], limit=2)
         bills_fmt = _format_bills_for_voice(bills)
-        reply = await llm_call(
-            [
-                {"role": "system", "content": _system_voice()},
-                {
-                    "role": "user",
-                    "content": (
-                        f"The caller asked: '{state['utterance']}'\n\n"
-                        f"Their recent bills:\n{bills_fmt}\n\n"
-                        f"Answer in 1-2 spoken sentences."
-                    ),
-                },
-            ]
-        )
+        messages = [
+            {"role": "system", "content": _system_voice()},
+            {
+                "role": "user",
+                "content": (
+                    f"The caller asked: '{state['utterance']}'\n\n"
+                    f"Their recent bills:\n{bills_fmt}\n\n"
+                    f"Answer in 1-2 spoken sentences."
+                ),
+            },
+        ]
         return {
-            "response": reply,
+            "final_prompt": messages,
             "tool_calls": [{"tool": "get_bill", "args": {"limit": 2}}],
         }
 
@@ -169,23 +170,21 @@ def build_agent_graph(
         account = state.get("account")
         if not account:
             return {"intent": "authentication"}
-        reply = await llm_call(
-            [
-                {"role": "system", "content": _system_voice()},
-                {
-                    "role": "user",
-                    "content": (
-                        f"The caller asked about their account: '{state['utterance']}'\n\n"
-                        f"Their account:\n"
-                        f"- Plan: {account['plan']}\n"
-                        f"- Region: {account['region']}\n"
-                        f"- Status: {account['status']}\n\n"
-                        f"Answer in 1-2 spoken sentences."
-                    ),
-                },
-            ]
-        )
-        return {"response": reply}
+        messages = [
+            {"role": "system", "content": _system_voice()},
+            {
+                "role": "user",
+                "content": (
+                    f"The caller asked about their account: '{state['utterance']}'\n\n"
+                    f"Their account:\n"
+                    f"- Plan: {account['plan']}\n"
+                    f"- Region: {account['region']}\n"
+                    f"- Status: {account['status']}\n\n"
+                    f"Answer in 1-2 spoken sentences."
+                ),
+            },
+        ]
+        return {"final_prompt": messages}
 
     async def plan_change_action(state: AgentState) -> dict[str, Any]:
         """Two-step: first turn asks confirmation, second turn executes."""
@@ -225,20 +224,18 @@ def build_agent_graph(
         # First turn: detect target plan and ask for confirmation.
         target = _detect_target_plan(state.get("utterance", ""))
         if target is None:
-            reply = await llm_call(
-                [
-                    {"role": "system", "content": _system_voice()},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"The caller wants to change plans but didn't specify "
-                            f"which. Currently on {account['plan']}. Ask which plan "
-                            f"they want, in one short sentence."
-                        ),
-                    },
-                ]
-            )
-            return {"response": reply}
+            messages = [
+                {"role": "system", "content": _system_voice()},
+                {
+                    "role": "user",
+                    "content": (
+                        f"The caller wants to change plans but didn't specify "
+                        f"which. Currently on {account['plan']}. Ask which plan "
+                        f"they want, in one short sentence."
+                    ),
+                },
+            ]
+            return {"final_prompt": messages}
         return {
             "response": (
                 f"You'd like to move from {account['plan']} to {target}. "
@@ -250,21 +247,19 @@ def build_agent_graph(
     async def technical_action(state: AgentState) -> dict[str, Any]:
         utter = state.get("utterance", "")
         context = await kb.render_context(utter, k=3)
-        reply = await llm_call(
-            [
-                {"role": "system", "content": _system_voice()},
-                {
-                    "role": "user",
-                    "content": (
-                        f"The caller reported: '{utter}'\n\n"
-                        f"Relevant docs:\n{context}\n\n"
-                        f"Give a brief spoken answer with the single most likely cause "
-                        f"and a simple next step. If no clear answer, offer to escalate."
-                    ),
-                },
-            ]
-        )
-        return {"response": reply, "retrieved_context": context}
+        messages = [
+            {"role": "system", "content": _system_voice()},
+            {
+                "role": "user",
+                "content": (
+                    f"The caller reported: '{utter}'\n\n"
+                    f"Relevant docs:\n{context}\n\n"
+                    f"Give a brief spoken answer with the single most likely cause "
+                    f"and a simple next step. If no clear answer, offer to escalate."
+                ),
+            },
+        ]
+        return {"final_prompt": messages, "retrieved_context": context}
 
     async def kb_action(state: AgentState) -> dict[str, Any]:
         utter = state.get("utterance", "")
@@ -276,24 +271,22 @@ def build_agent_graph(
             }
         context = "\n\n---\n\n".join(c.content for c in chunks)
         plan = (state.get("account") or {}).get("plan", "unknown")
-        reply = await llm_call(
-            [
-                {"role": "system", "content": _system_voice()},
-                {
-                    "role": "user",
-                    "content": (
-                        f"The caller is on the '{plan}' plan and asked: '{utter}'\n\n"
-                        f"Here is the relevant documentation. Answer the caller's "
-                        f"question directly using these facts — cite specific numbers "
-                        f"when the docs have them. Do NOT say 'let me check' or "
-                        f"'please hold' — the answer is in front of you. Reply in "
-                        f"1-2 spoken sentences.\n\n"
-                        f"DOCS:\n{context}"
-                    ),
-                },
-            ]
-        )
-        return {"response": reply, "retrieved_context": context}
+        messages = [
+            {"role": "system", "content": _system_voice()},
+            {
+                "role": "user",
+                "content": (
+                    f"The caller is on the '{plan}' plan and asked: '{utter}'\n\n"
+                    f"Here is the relevant documentation. Answer the caller's "
+                    f"question directly using these facts — cite specific numbers "
+                    f"when the docs have them. Do NOT say 'let me check' or "
+                    f"'please hold' — the answer is in front of you. Reply in "
+                    f"1-2 spoken sentences.\n\n"
+                    f"DOCS:\n{context}"
+                ),
+            },
+        ]
+        return {"final_prompt": messages, "retrieved_context": context}
 
     async def escalate(state: AgentState) -> dict[str, Any]:
         account = state.get("account") or {}

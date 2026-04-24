@@ -1,10 +1,15 @@
 """
 Kyutai TTS — streaming text-to-speech using the real moshi.run_tts API.
 
-Uses TTSModel.generate with a per-frame callback so we can push audio chunks
-into the Pipecat pipeline as soon as they're decoded. Kyutai's delayed-streams
-model starts emitting audio before the full text is consumed, keeping TTFS
-under 800 ms in practice.
+The `tts_model.generate` call drives the LM through the whole text, firing a
+per-frame callback each time a mimi audio frame is emitted. We decode each
+frame and push it onto an asyncio.Queue from the worker thread (thread-safe
+via `loop.call_soon_threadsafe`). The outer async generator pulls from the
+queue and yields TTSAudioRawFrames as they arrive — meaning the first chunk
+reaches Pipecat's transport ~80-200 ms after the LM starts, not after the
+whole utterance finishes.
+
+Kyutai's mimi codec runs at 12.5 Hz → one frame every 80 ms of audio.
 """
 
 from __future__ import annotations
@@ -33,6 +38,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_VOICE = "alba-mackenna/announcer.wav"
 
+# Sentinel pushed onto the queue when generation finishes.
+_GEN_DONE = object()
+
 
 class KyutaiTTSService(TTSService):
     """Streaming TTS. Emits audio bytes as soon as mimi decodes them."""
@@ -46,10 +54,9 @@ class KyutaiTTSService(TTSService):
         cfg_coef: float = 2.0,
         cost_ledger: CostLedger | None = None,
     ) -> None:
-        # Sample rate is set from the loaded model; default to 24k for init.
         super().__init__(sample_rate=24_000)
         self.voice = voice
-        self.speed = speed  # kept for API symmetry; moshi TTS doesn't expose a direct speed knob
+        self.speed = speed
         self.temperature = temperature
         self.cfg_coef = cfg_coef
         self.cost_ledger = cost_ledger
@@ -84,55 +91,71 @@ class KyutaiTTSService(TTSService):
         )
 
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
-        """Synthesize `text` and yield audio frames as they become available."""
+        """Synthesize `text`; yield audio frames as they're decoded."""
         if not text.strip():
             return
         await self._ensure_loaded()
         yield TTSStartedFrame()
 
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
         start = time.monotonic()
         first_byte_recorded = False
-        pcm_chunks: list[np.ndarray] = []
 
         def _on_frame(frame):
             nonlocal first_byte_recorded
-            # Guard against padding / silence tokens
+            # Padding/silence tokens: skip.
             if (frame == -1).any():
                 return
-            pcm = self._tts.mimi.decode(frame[:, 1:, :]).cpu().numpy()
-            arr = np.clip(pcm[0, 0], -1, 1)
-            pcm_chunks.append(arr)
+            try:
+                pcm = self._tts.mimi.decode(frame[:, 1:, :]).cpu().numpy()
+                arr = np.clip(pcm[0, 0], -1, 1)
+            except Exception as exc:  # noqa: BLE001 — surface to the awaiter
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+                return
+
             if not first_byte_recorded:
                 TTS_TTFS.observe(time.monotonic() - start)
                 first_byte_recorded = True
-
-        import torch
-        from moshi.run_tts import TTSRequest  # noqa: F401 — imported for parity
+            # Thread-safe push from the moshi worker thread into the asyncio queue.
+            loop.call_soon_threadsafe(queue.put_nowait, arr)
 
         voices = [self._tts.get_voice_path(self.voice)]
         all_entries = [self._tts.prepare_script([text], padding_between=1)]
         cond = self._tts.make_condition_attributes(voices, cfg_coef=self.cfg_coef)
 
-        # moshi's generate is sync/GPU-heavy; run in a thread so we don't block
-        # the asyncio loop. We yield frames after generation completes; the
-        # on_frame callback already captured them.
-        await asyncio.to_thread(
-            lambda: self._generate(all_entries, [cond], _on_frame)
-        )
+        async def _drive_generation() -> None:
+            try:
+                await asyncio.to_thread(
+                    lambda: self._generate(all_entries, [cond], _on_frame)
+                )
+            except Exception as exc:  # noqa: BLE001 — propagate via queue
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, _GEN_DONE)
 
-        # Stream PCM chunks to Pipecat as they come out. For truly low-latency
-        # streaming, on_frame would await a queue directly; keeping it simple here.
+        gen_task = asyncio.create_task(_drive_generation())
+
         total_samples = 0
-        for arr in pcm_chunks:
-            pcm_i16 = (arr * 32767).astype(np.int16).tobytes()
-            total_samples += len(arr)
-            yield TTSAudioRawFrame(
-                audio=pcm_i16,
-                sample_rate=self._tts.mimi.sample_rate,
-                num_channels=1,
-            )
+        try:
+            while True:
+                item = await queue.get()
+                if item is _GEN_DONE:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                arr: np.ndarray = item
+                pcm_i16 = (arr * 32767).astype(np.int16).tobytes()
+                total_samples += len(arr)
+                yield TTSAudioRawFrame(
+                    audio=pcm_i16,
+                    sample_rate=self._tts.mimi.sample_rate,
+                    num_channels=1,
+                )
+        finally:
+            await gen_task
 
-        if self.cost_ledger is not None:
+        if self.cost_ledger is not None and total_samples > 0:
             self.cost_ledger.add_audio_minute(
                 phase="tts",
                 provider_model="kyutai:tts-1.6b",
@@ -142,7 +165,7 @@ class KyutaiTTSService(TTSService):
         yield TTSStoppedFrame()
 
     def _generate(self, all_entries, conds, on_frame):
-        """Sync wrapper around tts.generate — must run in a worker thread."""
+        """Sync wrapper around tts.generate — runs in a worker thread."""
         import torch
 
         with self._tts.mimi.streaming(1), torch.no_grad():

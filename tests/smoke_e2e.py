@@ -33,17 +33,26 @@ from src.agent.llm import LLMRouter  # noqa: E402
 from src.guardrails.pii import default_redactor  # noqa: E402
 
 
-async def run_turn(graph, state, utterance, label):
+async def run_turn(router, graph, state, utterance, label):
     state["utterance"] = utterance
     result = await graph.ainvoke(state)
     # carry forward session state like the pipeline would
     for k in ("authenticated", "account", "pending_confirmation"):
         if k in result:
             state[k] = result[k]
+    # Resolve the spoken reply: rule-based nodes set `response`; LLM nodes
+    # set `final_prompt` so the pipeline can stream it. Here we assemble it
+    # by draining the stream end-to-end.
+    response = result.get("response")
+    if not response and result.get("final_prompt"):
+        chunks = []
+        async for chunk in router.stream_chat(result["final_prompt"], temperature=0.2):
+            chunks.append(chunk)
+        response = "".join(chunks)
     print(f"\n--- {label} ---")
     print(f"  Caller   : {utterance}")
     print(f"  Intent   : {result.get('intent', '?')}")
-    print(f"  Response : {result.get('response', '<empty>')}")
+    print(f"  Response : {response or '<empty>'}")
     if result.get("should_escalate"):
         print(f"  Escalate : YES (ticket={result.get('ticket_id', '?')})")
     return result, state
@@ -73,6 +82,7 @@ async def main():
 
     # ---- Turn 1: auth via email
     await run_turn(
+        router,
         graph,
         state,
         "Hi, my email is alice@example.com",
@@ -83,6 +93,7 @@ async def main():
 
     # ---- Turn 2: billing question (tool call: get_bill)
     await run_turn(
+        router,
         graph,
         state,
         "What's my bill this month?",
@@ -91,6 +102,7 @@ async def main():
 
     # ---- Turn 3: plan change (should ask for confirmation, not execute yet)
     await run_turn(
+        router,
         graph,
         state,
         "I'd like to upgrade to the Scale plan.",
@@ -100,6 +112,7 @@ async def main():
 
     # ---- Turn 4: confirm the plan change (should execute change_plan)
     await run_turn(
+        router,
         graph,
         state,
         "Yes, go ahead.",
@@ -108,6 +121,7 @@ async def main():
 
     # ---- Turn 5: KB question (RAG over Acme docs)
     await run_turn(
+        router,
         graph,
         state,
         "How long does backup retention last on my plan?",
@@ -116,6 +130,7 @@ async def main():
 
     # ---- Turn 6: explicit human escalation
     await run_turn(
+        router,
         graph,
         state,
         "Actually, can you transfer me to a human?",
