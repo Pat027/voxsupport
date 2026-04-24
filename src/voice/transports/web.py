@@ -13,11 +13,15 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, WebSocket
-from pipecat.transports.network.fastapi_websocket import (
+from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
-from pipecat.vad.silero import SileroVADAnalyzer
+
+try:
+    from pipecat.audio.vad.silero import SileroVADAnalyzer
+except ImportError:
+    from pipecat.vad.silero import SileroVADAnalyzer
 
 logger = logging.getLogger(__name__)
 

@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from src.observability import metrics as _metrics  # noqa: F401 — registers Prometheus collectors at import time
 from src.voice.transports import twilio as twilio_transport
 from src.voice.transports import web as web_transport
 

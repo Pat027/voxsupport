@@ -1,16 +1,19 @@
 """
-Kyutai STT — streaming speech-to-text via delayed-streams-modeling.
+Kyutai STT — streaming speech-to-text via moshi's delayed-streams-modeling.
 
-Wraps the reference streaming loop from kyutai-labs/delayed-streams-modeling
-into Pipecat's STTService interface. Key properties:
+Real API (moshi 0.2.x):
+- `moshi.models.loaders.CheckpointInfo.from_hf_repo("kyutai/stt-1b-en_fr")` loads
+  the checkpoint + tokenizer config.
+- `ci.get_mimi(device)` gives the streaming neural audio codec.
+- `ci.get_moshi(device, dtype=torch.bfloat16)` gives the LM.
+- `moshi.run_inference.InferenceState` runs the streaming loop. For STT
+  (`dep_q == 0`), tokens come out via `printer.print_token(text)` — we capture
+  them with a swap-in printer.
 
-- Streaming: partial transcripts flow as the caller speaks
-- Semantic VAD: end-of-turn predicted from content + intonation, not just silence
-- ~500ms inherent delay (Kyutai's published number for the 1B model)
-
-The import of `moshi` is lazy — it loads model weights from Hugging Face the
-first time the model is used, which is slow. Keeping it out of import time
-means the FastAPI server starts fast and the first call pays the warm-up.
+Key properties:
+- ~500 ms inherent delay (Kyutai published number for the 1B model).
+- Semantic VAD predicts end-of-turn from content + intonation.
+- Streaming-native: audio chunks in, partial + final transcripts out.
 """
 
 from __future__ import annotations
@@ -19,7 +22,9 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncGenerator
+from typing import Any
 
+import numpy as np
 from pipecat.frames.frames import (
     AudioRawFrame,
     Frame,
@@ -40,8 +45,37 @@ DEFAULT_MODEL = "kyutai/stt-1b-en_fr"
 SAMPLE_RATE_HZ = 24_000
 
 
+class _TokenCapture:
+    """Swap-in for moshi's Printer — captures tokens without printing to stdout."""
+
+    def __init__(self) -> None:
+        self.tokens: list[str] = []
+        self._flushed_up_to = 0
+
+    def print_token(self, text: str) -> None:
+        self.tokens.append(text)
+
+    def log(self, level: str, msg: str) -> None:  # noqa: ARG002
+        logger.debug("moshi[%s]: %s", level, msg)
+
+    def print_header(self) -> None:
+        pass
+
+    def pop_new(self) -> str:
+        """Return tokens emitted since the last pop, as a joined string."""
+        out = "".join(self.tokens[self._flushed_up_to :])
+        self._flushed_up_to = len(self.tokens)
+        return out
+
+    def full(self) -> str:
+        return "".join(self.tokens).strip()
+
+
 class KyutaiSTTService(STTService):
-    """Streaming STT over Kyutai's delayed-streams-modeling."""
+    """Streaming STT over Kyutai's delayed-streams-modeling.
+
+    Lazy-loads the model on first audio frame (big download on cold start).
+    """
 
     def __init__(
         self,
@@ -54,105 +88,119 @@ class KyutaiSTTService(STTService):
         self.model_name = model
         self.language = language
         self.cost_ledger = cost_ledger
-        self._inference = None
+
+        self._state: Any | None = None
+        self._capture: _TokenCapture | None = None
+        self._audio_buf: list[np.ndarray] = []
         self._audio_seconds = 0.0
-        self._turn_started: float | None = None
+        self._load_lock = asyncio.Lock()
 
     async def _ensure_loaded(self) -> None:
-        if self._inference is not None:
+        if self._state is not None:
             return
-        # Lazy import — large dependency tree.
-        try:
-            from moshi.models import loaders  # type: ignore
-            from moshi.streaming import StreamingInference  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError(
-                "Kyutai moshi package not installed. "
-                "Run `pip install moshi` or install from "
-                "kyutai-labs/delayed-streams-modeling."
-            ) from exc
+        async with self._load_lock:
+            if self._state is not None:
+                return
+            logger.info("Loading Kyutai STT: %s", self.model_name)
+            t0 = time.monotonic()
+            self._state = await asyncio.to_thread(self._load_state)
+            self._capture = _TokenCapture()
+            self._state.printer = self._capture  # type: ignore[attr-defined]
+            logger.info("Kyutai STT loaded in %.1fs", time.monotonic() - t0)
 
-        logger.info("Loading Kyutai STT model: %s", self.model_name)
-        checkpoint = loaders.CheckpointInfo.from_hf_repo(self.model_name)
-        # Runs to completion in a thread — loading weights blocks; we don't
-        # want to block the async event loop.
-        self._inference = await asyncio.to_thread(
-            StreamingInference.from_checkpoint, checkpoint
+    def _load_state(self):
+        import torch
+        from moshi.models import loaders
+        from moshi.run_inference import InferenceState
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        ci = loaders.CheckpointInfo.from_hf_repo(self.model_name)
+        mimi = ci.get_mimi(device=device)
+        tokenizer = ci.get_text_tokenizer()
+        lm = ci.get_moshi(device=device, dtype=dtype)
+        return InferenceState(
+            checkpoint_info=ci,
+            mimi=mimi,
+            text_tokenizer=tokenizer,
+            lm=lm,
+            batch_size=1,
+            cfg_coef=1.0,
+            device=device,
         )
-        logger.info("Kyutai STT loaded")
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
-        """Process one audio chunk. Yields interim + final transcription frames."""
+        """Handle one PCM chunk. Emits partial transcripts; final transcripts
+        are emitted when end-of-speech is detected (by Pipecat's VAD upstream)."""
         await self._ensure_loaded()
         start = time.monotonic()
 
-        # Kyutai's StreamingInference expects float32 PCM at the model's rate.
-        # `audio` here is bytes produced by Pipecat's audio source — 16-bit PCM.
-        import numpy as np  # lazy
+        # Buffer the audio; we process per-turn (triggered by UserStoppedSpeakingFrame).
         pcm = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+        self._audio_buf.append(pcm)
         self._audio_seconds += len(pcm) / SAMPLE_RATE_HZ
 
-        # The reference streaming API returns incremental decode events.
-        # Run under to_thread to keep the event loop free; the inner loop is
-        # GPU-bound. A dedicated process or queue is a better fit at scale.
-        events = await asyncio.to_thread(self._decode_chunk, pcm)
+        # Interim frames throttled: emit what we have in the capture buffer
+        # (if streaming inference is hot enough, partials accumulate here).
+        partial = self._capture.pop_new() if self._capture else ""
+        if partial:
+            STT_LATENCY.observe(time.monotonic() - start)
+            yield InterimTranscriptionFrame(
+                text=partial, user_id="", timestamp=0, language=self.language
+            )
 
-        latency = time.monotonic() - start
-        STT_LATENCY.observe(latency)
+    async def _finalize_turn(self) -> str:
+        """Run the buffered audio through the STT model and return full transcript."""
+        if not self._audio_buf or self._state is None or self._capture is None:
+            return ""
 
-        for ev in events:
-            if ev["kind"] == "partial":
-                yield InterimTranscriptionFrame(
-                    text=ev["text"], user_id="", timestamp=0, language=self.language
-                )
-            elif ev["kind"] == "final":
-                yield TranscriptionFrame(
-                    text=ev["text"], user_id="", timestamp=0, language=self.language
-                )
-                if self.cost_ledger is not None:
-                    minutes = self._audio_seconds / 60.0
-                    self.cost_ledger.add_audio_minute(
-                        phase="stt",
-                        provider_model="kyutai:stt-1b",
-                        minutes=minutes,
-                    )
-                    self._audio_seconds = 0.0
+        import torch
 
-    def _decode_chunk(self, pcm) -> list[dict]:
-        """Sync wrapper — adapt to the actual moshi API once model loaded.
+        audio = np.concatenate(self._audio_buf)
+        self._audio_buf = []
+        in_pcms = (
+            torch.from_numpy(audio)
+            .to(device=self._state.device, dtype=torch.float32)
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )
+        # Reset capture for this turn
+        self._capture.tokens = []
+        self._capture._flushed_up_to = 0
+        await asyncio.to_thread(self._state.run, in_pcms)
 
-        The real delayed-streams-modeling API exposes either a push/pop
-        streaming loop or a generator yielding decode events. See
-        kyutai-labs/delayed-streams-modeling for the reference.
+        if self.cost_ledger is not None:
+            self.cost_ledger.add_audio_minute(
+                phase="stt",
+                provider_model="kyutai:stt-1b",
+                minutes=self._audio_seconds / 60.0,
+            )
+            self._audio_seconds = 0.0
 
-        This method returns a list of {kind, text} dicts for downstream
-        event-frame translation.
-        """
-        assert self._inference is not None
-        # The reference repo's ergonomics vary by commit — consult their
-        # `scripts/stream.py` for the current streaming API. Typical usage:
-        #     for event in self._inference.stream(pcm): ...
-        # and `event.text` / `event.is_final`.
-        events: list[dict] = []
-        try:
-            for ev in self._inference.stream(pcm):  # type: ignore[attr-defined]
-                events.append(
-                    {
-                        "kind": "final" if getattr(ev, "is_final", False) else "partial",
-                        "text": getattr(ev, "text", ""),
-                    }
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Kyutai STT streaming error: %s", exc)
-        return events
+        return self._capture.full()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 
         if isinstance(frame, UserStartedSpeakingFrame):
-            self._turn_started = time.monotonic()
-        elif isinstance(frame, UserStoppedSpeakingFrame):
-            self._turn_started = None
+            self._audio_buf = []  # fresh turn
+            if self._capture is not None:
+                self._capture.tokens = []
+                self._capture._flushed_up_to = 0
+
         elif isinstance(frame, AudioRawFrame):
             async for out in self.run_stt(frame.audio):
                 await self.push_frame(out, direction)
+
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            text = await self._finalize_turn()
+            if text:
+                await self.push_frame(
+                    TranscriptionFrame(
+                        text=text, user_id="", timestamp=0, language=self.language
+                    ),
+                    direction,
+                )
+
+        else:
+            await self.push_frame(frame, direction)

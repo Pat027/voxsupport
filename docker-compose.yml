@@ -46,8 +46,18 @@ services:
       DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
       NEXTAUTH_SECRET: dev-secret-change-me
       SALT: dev-salt-change-me
-      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_URL: http://localhost:3010
       TELEMETRY_ENABLED: "false"
+      # Auto-provision on first boot — no UI signup needed for local smoke tests.
+      LANGFUSE_INIT_ORG_ID: voxsupport-org
+      LANGFUSE_INIT_ORG_NAME: voxsupport
+      LANGFUSE_INIT_PROJECT_ID: voxsupport-project
+      LANGFUSE_INIT_PROJECT_NAME: voxsupport-smoke
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-voxsupport-smoke
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-voxsupport-smoke
+      LANGFUSE_INIT_USER_EMAIL: smoke@voxsupport.local
+      LANGFUSE_INIT_USER_NAME: Smoke
+      LANGFUSE_INIT_USER_PASSWORD: smokesmoke123
     ports:
       - "3010:3000"
 

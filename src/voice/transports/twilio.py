@@ -28,11 +28,15 @@ from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import Response
 
 from pipecat.serializers.twilio import TwilioFrameSerializer
-from pipecat.transports.network.fastapi_websocket import (
+from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
-from pipecat.vad.silero import SileroVADAnalyzer
+
+try:
+    from pipecat.audio.vad.silero import SileroVADAnalyzer
+except ImportError:
+    from pipecat.vad.silero import SileroVADAnalyzer
 
 logger = logging.getLogger(__name__)
 
